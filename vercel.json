@@ -1,0 +1,19 @@
+{
+  "functions": {
+    "app/api/optimize/route.ts": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Powered-By",
+          "value": ""
+        }
+      ]
+    }
+  ]
+}
