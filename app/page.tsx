@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef } from 'react';
+import { upload } from '@vercel/blob/client';
 import { FileItem, OutputFormat } from '@/lib/types';
 import { createQueue } from '@/lib/queue';
 import { downloadZip, downloadSingle } from '@/lib/download';
@@ -11,6 +12,10 @@ import FileList from '@/components/FileList';
 
 const queue = createQueue(3);
 let nextId = 0;
+
+// Vercel Hobby plan has a 4.5 MB body limit on serverless functions.
+// Files larger than this are staged via Vercel Blob first.
+const DIRECT_UPLOAD_LIMIT = 4 * 1024 * 1024; // 4 MB (safe margin)
 
 const EXT_MAP: Record<string, string> = {
   'image/webp': 'webp',
@@ -62,7 +67,7 @@ export default function Home() {
     async (item: FileItem) => {
       updateItem(item.id, { status: 'processing', progress: 0 });
 
-      // Animate progress to ~55% during upload
+      // Animate progress during upload/processing
       const progressInterval = setInterval(() => {
         setItems((prev) => {
           const current = prev.find((i) => i.id === item.id);
@@ -76,12 +81,21 @@ export default function Home() {
       }, 50);
 
       try {
+        const format = item.converting && item.targetFmt ? item.targetFmt : 'original';
         const formData = new FormData();
-        formData.append('file', item.file);
-        formData.append(
-          'format',
-          item.converting && item.targetFmt ? item.targetFmt : 'original'
-        );
+        formData.append('format', format);
+
+        if (item.file.size > DIRECT_UPLOAD_LIMIT) {
+          // Large file: stage via Vercel Blob, then send URL to optimize
+          const newBlob = await upload(item.file.name, item.file, {
+            access: 'public',
+            handleUploadUrl: '/api/upload',
+          });
+          formData.append('blobUrl', newBlob.url);
+        } else {
+          // Small file: direct multipart upload
+          formData.append('file', item.file);
+        }
 
         const response = await fetch('/api/optimize', {
           method: 'POST',

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import sharp from 'sharp';
+import { del } from '@vercel/blob';
 
 const MAX_FILE_SIZE = 75 * 1024 * 1024; // 75 MB
 
@@ -37,7 +38,9 @@ function mimeForFormat(fmt: string): string {
 }
 
 async function compressImage(inputBuffer: Buffer, inputFormat: string, outputFormat: string): Promise<Buffer> {
-  let pipeline = sharp(inputBuffer);
+  // Auto-rotate from EXIF orientation (strips EXIF orientation tag automatically)
+  // Sharp strips all metadata by default -- no withMetadata() needed
+  let pipeline = sharp(inputBuffer).rotate();
 
   // For formats that don't support transparency converting to JPEG, flatten with white bg
   if (outputFormat === 'jpeg' && (inputFormat === 'png' || inputFormat === 'webp' || inputFormat === 'avif' || inputFormat === 'gif')) {
@@ -46,20 +49,21 @@ async function compressImage(inputBuffer: Buffer, inputFormat: string, outputFor
 
   switch (outputFormat) {
     case 'png':
-      // Palette quantization -- the key setting that matches TinyPNG
-      return pipeline.png({ compressionLevel: 9, palette: true, quality: 100 }).toBuffer();
+      // Palette quantization with quality 80 -- closer to TinyPNG's pngquant behavior
+      return pipeline.png({ compressionLevel: 9, palette: true, quality: 80 }).toBuffer();
     case 'jpeg':
-      // MozJPEG encoder at Q78 -- matches TinyPNG Q75-80 range
-      return pipeline.jpeg({ quality: 78, mozjpeg: true }).toBuffer();
+      // MozJPEG at Q72 -- real-world testing shows TinyPNG operates at Q68-75 equivalent
+      // MozJPEG's perceptual encoder makes Q72 visually indistinguishable from original
+      return pipeline.jpeg({ quality: 72, mozjpeg: true }).toBuffer();
     case 'webp':
-      // libwebp at Q78
-      return pipeline.webp({ quality: 78 }).toBuffer();
+      // libwebp Q72 -- matched to JPEG target for consistent savings
+      return pipeline.webp({ quality: 72 }).toBuffer();
     case 'avif':
-      // AVIF Q60 is visually equivalent to JPEG Q78
-      return pipeline.avif({ quality: 60 }).toBuffer();
+      // AVIF Q55 is visually equivalent to JPEG Q72 due to more efficient codec
+      return pipeline.avif({ quality: 55 }).toBuffer();
     default:
       // For GIF/BMP input with "original" format, convert to PNG with palette
-      return pipeline.png({ compressionLevel: 9, palette: true, quality: 100 }).toBuffer();
+      return pipeline.png({ compressionLevel: 9, palette: true, quality: 80 }).toBuffer();
   }
 }
 
@@ -78,18 +82,36 @@ export async function POST(request: NextRequest) {
     let inputBuffer: Buffer;
     let requestedFormat = 'original';
 
+    let blobUrlToCleanup: string | null = null;
+
     if (contentType.includes('multipart/form-data')) {
       // Browser upload mode -- no API key required (same-origin)
       const formData = await request.formData();
       const file = formData.get('file') as File | null;
-      if (!file) {
-        return NextResponse.json({ error: 'No file provided' }, { status: 400 });
-      }
-      if (file.size > MAX_FILE_SIZE) {
-        return NextResponse.json({ error: 'File exceeds 75 MB limit' }, { status: 413 });
-      }
+      const blobUrl = formData.get('blobUrl') as string | null;
       requestedFormat = (formData.get('format') as string) || 'original';
-      inputBuffer = Buffer.from(await file.arrayBuffer());
+
+      if (blobUrl) {
+        // Large file flow: file was uploaded to Vercel Blob first
+        blobUrlToCleanup = blobUrl;
+        const res = await fetch(blobUrl);
+        if (!res.ok) {
+          return NextResponse.json({ error: 'Failed to fetch from blob storage' }, { status: 400 });
+        }
+        const arrayBuffer = await res.arrayBuffer();
+        if (arrayBuffer.byteLength > MAX_FILE_SIZE) {
+          return NextResponse.json({ error: 'File exceeds 75 MB limit' }, { status: 413 });
+        }
+        inputBuffer = Buffer.from(arrayBuffer);
+      } else if (file) {
+        // Direct upload (files <= 4 MB)
+        if (file.size > MAX_FILE_SIZE) {
+          return NextResponse.json({ error: 'File exceeds 75 MB limit' }, { status: 413 });
+        }
+        inputBuffer = Buffer.from(await file.arrayBuffer());
+      } else {
+        return NextResponse.json({ error: 'No file or blobUrl provided' }, { status: 400 });
+      }
 
     } else {
       // Agent/programmatic JSON mode -- API key required
@@ -142,6 +164,11 @@ export async function POST(request: NextRequest) {
     const finalBuffer = (compressedSize >= originalSize && outputFormat === inputFormat) ? inputBuffer : compressedBuffer;
     const finalSize = finalBuffer.length;
     const savingsPct = Math.max(0, Math.round((1 - finalSize / originalSize) * 100));
+
+    // Clean up Vercel Blob if used (best-effort, don't block response)
+    if (blobUrlToCleanup) {
+      del(blobUrlToCleanup).catch(() => {});
+    }
 
     return new NextResponse(new Uint8Array(finalBuffer), {
       status: 200,
