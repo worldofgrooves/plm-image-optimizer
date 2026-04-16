@@ -95,7 +95,9 @@ export async function POST(request: NextRequest) {
       // Agent/programmatic JSON mode -- API key required
       const apiKey = request.headers.get('x-api-key');
       const expectedKey = process.env.OPTIMIZER_API_KEY;
-      console.log('ENV_CHECK', expectedKey ? 'HAS_KEY' : 'NO_KEY', 'MATCH:', apiKey === expectedKey);
+      const trimmedExpected = expectedKey?.trim();
+      const trimmedApi = apiKey?.trim();
+      console.log('ENV_CHECK len:', expectedKey?.length, 'api_len:', apiKey?.length, 'trimMatch:', trimmedApi === trimmedExpected);
       if (!expectedKey || apiKey !== expectedKey) {
         return NextResponse.json({ error: 'Invalid or missing API key' }, { status: 401 });
       }
